@@ -3,11 +3,14 @@
 -- Run this in Supabase Dashboard -> SQL Editor -> New Query -> Run
 -- ============================================================
 
--- Profile: current weight/height per user
+-- Profile: current weight/height per user + auto day-pointer (which plan day is "today")
 create table if not exists profiles (
   id uuid primary key references auth.users(id) on delete cascade,
   weight numeric,
   height numeric,
+  current_phase int default 1,
+  current_day_index int default 0,
+  last_training_date date,
   updated_at timestamptz default now()
 );
 
@@ -31,6 +34,7 @@ create table if not exists workout_logs (
   title text,
   items jsonb not null default '[]',
   calories int,
+  duration_minutes int,
   unique (user_id, date, phase, day_index)
 );
 

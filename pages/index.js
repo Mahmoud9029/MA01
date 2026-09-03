@@ -5,19 +5,52 @@ import { PLAN, pickIcon, ICONS } from '../lib/plan';
 
 function iconSvg(key) {
   return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round"
       dangerouslySetInnerHTML={{ __html: ICONS[key] || ICONS.dumbbell }} />
   );
 }
 function todayStr() { return new Date().toISOString().slice(0, 10); }
+function formatDateTime(d) {
+  return d.toLocaleDateString('de-DE', { weekday: 'short', day: 'numeric', month: 'short' }) +
+    ' · ' + d.toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' });
+}
+
+/* Reusable minimal line chart (weight, duration, per-exercise weight all use this) */
+function LineChart({ points, color = '#c1622d' }) {
+  if (!points || points.length < 2) {
+    return <p className="weight-empty-note">Noch nicht genug Einträge für ein Diagramm.</p>;
+  }
+  const values = points.map((p) => p.value);
+  const min = Math.min(...values) - 1, max = Math.max(...values) + 1;
+  const W = 320, H = 110, pad = 10;
+  const innerW = W - pad * 2, innerH = H - pad * 2;
+  const pts = points.map((p, i) => ({
+    x: pad + (innerW * i) / (points.length - 1),
+    y: pad + innerH - ((p.value - min) / (max - min || 1)) * innerH,
+  }));
+  const linePath = pts.map((p, i) => (i === 0 ? 'M' : 'L') + p.x.toFixed(1) + ',' + p.y.toFixed(1)).join(' ');
+  return (
+    <>
+      <svg viewBox={`0 0 ${W} ${H}`} style={{ width: '100%', height: 110 }}>
+        <path d={linePath} fill="none" stroke={color} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+        {pts.map((p, i) => <circle key={i} cx={p.x} cy={p.y} r="3" fill={color} />)}
+      </svg>
+      <div className="chart-meta">
+        <span>{points[0].date}: {points[0].value}</span>
+        <span>{points[points.length - 1].date}: {points[points.length - 1].value}</span>
+      </div>
+    </>
+  );
+}
 
 export default function Home() {
   const router = useRouter();
   const [session, setSession] = useState(null);
   const [checking, setChecking] = useState(true);
   const [tab, setTab] = useState('training');
-  const [phase, setPhase] = useState(1);
-  const [dayIndex, setDayIndex] = useState(0);
+  const [profile, setProfile] = useState(null);
+  const [todayRow, setTodayRow] = useState(undefined); // undefined=loading, null=none found, object=finished today
+  const [forceTraining, setForceTraining] = useState(false);
   const [status, setStatus] = useState('');
 
   useEffect(() => {
@@ -33,7 +66,34 @@ export default function Home() {
     return () => sub.subscription.unsubscribe();
   }, [router]);
 
+  const loadProfile = useCallback(async (userId) => {
+    let { data } = await supabase.from('profiles').select('*').eq('id', userId).maybeSingle();
+    if (!data) {
+      const { data: created } = await supabase.from('profiles')
+        .upsert({ id: userId, current_phase: 1, current_day_index: 0 }).select().single();
+      data = created;
+    }
+    setProfile(data);
+  }, []);
+
+  const loadTodayRow = useCallback(async (userId) => {
+    const { data } = await supabase.from('workout_logs').select('*')
+      .eq('user_id', userId).eq('date', todayStr()).not('calories', 'is', null)
+      .order('id', { ascending: false }).limit(1).maybeSingle();
+    setTodayRow(data || null);
+  }, []);
+
+  useEffect(() => {
+    if (session) { loadProfile(session.user.id); loadTodayRow(session.user.id); }
+  }, [session, loadProfile, loadTodayRow]);
+
   function flash(msg) { setStatus(msg); setTimeout(() => setStatus((s) => (s === msg ? '' : s)), 1200); }
+
+  function handleFinished(updatedProfile, savedRow) {
+    setProfile(updatedProfile);
+    setTodayRow(savedRow);
+    setForceTraining(false);
+  }
 
   if (checking || !session) return <div className="wrap"><p>Lädt…</p></div>;
 
@@ -48,13 +108,17 @@ export default function Home() {
         <button className={`main-tab ${tab === 'einstellungen' ? 'active' : ''}`} onClick={() => setTab('einstellungen')}>Einstellungen</button>
       </div>
 
-      {tab === 'training' && (
-        <TrainingTab
-          userId={session.user.id}
-          phase={phase} setPhase={setPhase}
-          dayIndex={dayIndex} setDayIndex={setDayIndex}
-          flash={flash}
-        />
+      {tab === 'training' && profile && (
+        todayRow && !forceTraining ? (
+          <SummaryView row={todayRow} onEditAnother={() => setForceTraining(true)} />
+        ) : (
+          <TrainingTab
+            userId={session.user.id}
+            profile={profile}
+            flash={flash}
+            onFinished={handleFinished}
+          />
+        )
       )}
       {tab === 'verlauf' && <VerlaufTab userId={session.user.id} />}
       {tab === 'einstellungen' && <EinstellungenTab userId={session.user.id} flash={flash} />}
@@ -64,14 +128,47 @@ export default function Home() {
   );
 }
 
+/* ---------------- Summary (shown once today's training is finished) ---------------- */
+function SummaryView({ row, onEditAnother }) {
+  const total = row.items.length;
+  const done = row.items.filter((it) => it.checked).length;
+  return (
+    <div className="card summary-card">
+      <h2 className="card-title">Heute erledigt ✅</h2>
+      <p className="summary-sub">{row.title}</p>
+      <div className="summary-stats">
+        <div className="summary-stat"><div className="big">{row.calories || 0}</div><div className="lbl">kcal</div></div>
+        <div className="summary-stat"><div className="big">{row.duration_minutes ?? '–'}</div><div className="lbl">Minuten</div></div>
+        <div className="summary-stat"><div className="big">{done}/{total}</div><div className="lbl">Übungen</div></div>
+      </div>
+      <ul className="items">
+        {row.items.map((it, i) => (
+          <li key={i} className={`item summary-item ${it.checked ? 'checked' : ''}`}>
+            <span className="item-text">{it.checked ? '✓' : '—'} {it.text}</span>
+            {it.weight && <span className="summary-weight">{it.weight} kg</span>}
+          </li>
+        ))}
+      </ul>
+      <button className="reset-btn" onClick={onEditAnother}>Anderen Tag trainieren / nachtragen</button>
+    </div>
+  );
+}
+
 /* ---------------- Training Tab ---------------- */
-function TrainingTab({ userId, phase, setPhase, dayIndex, setDayIndex, flash }) {
-  const [row, setRow] = useState(null); // today's workout_logs row for this phase/day
-  const [photos, setPhotos] = useState({}); // item_index -> photo_url
-  const [dayDoneMap, setDayDoneMap] = useState({});
-  const [trainingStart, setTrainingStart] = useState(null); // Date.now() when "Start" pressed
+function TrainingTab({ userId, profile, flash, onFinished }) {
+  const [phase, setPhase] = useState(profile.current_phase || 1);
+  const [dayIndex, setDayIndex] = useState(profile.current_day_index || 0);
+  const [row, setRow] = useState(null);
+  const [photos, setPhotos] = useState({});
+  const [trainingStart, setTrainingStart] = useState(null);
   const [elapsedSec, setElapsedSec] = useState(0);
+  const [now, setNow] = useState(new Date());
   const day = PLAN[phase][dayIndex];
+
+  useEffect(() => {
+    const id = setInterval(() => setNow(new Date()), 1000 * 30);
+    return () => clearInterval(id);
+  }, []);
 
   useEffect(() => {
     if (!trainingStart) return;
@@ -79,20 +176,12 @@ function TrainingTab({ userId, phase, setPhase, dayIndex, setDayIndex, flash }) 
     return () => clearInterval(id);
   }, [trainingStart]);
 
-  function startTraining() {
-    setTrainingStart(Date.now());
-    setElapsedSec(0);
-  }
-
   const loadRow = useCallback(async () => {
-    const date = todayStr();
-    const { data } = await supabase
-      .from('workout_logs')
-      .select('*')
-      .eq('user_id', userId).eq('date', date).eq('phase', phase).eq('day_index', dayIndex)
+    const { data } = await supabase.from('workout_logs').select('*')
+      .eq('user_id', userId).eq('date', todayStr()).eq('phase', phase).eq('day_index', dayIndex)
       .maybeSingle();
     if (data) setRow(data);
-    else setRow({ items: day.items.map((text) => ({ text, checked: false, weight: '' })), calories: null });
+    else setRow({ items: day.items.map((text) => ({ text, checked: false, weight: '' })), calories: null, duration_minutes: null });
   }, [userId, phase, dayIndex, day.items]);
 
   const loadPhotos = useCallback(async () => {
@@ -103,92 +192,62 @@ function TrainingTab({ userId, phase, setPhase, dayIndex, setDayIndex, flash }) 
     setPhotos(map);
   }, [userId, phase, dayIndex]);
 
-  const loadDoneMap = useCallback(async () => {
-    const date = todayStr();
-    const { data } = await supabase.from('workout_logs').select('day_index, items')
-      .eq('user_id', userId).eq('date', date).eq('phase', phase);
-    const map = {};
-    (data || []).forEach((r) => {
-      const total = PLAN[phase][r.day_index].items.length;
-      const done = r.items.filter((it) => it.checked).length;
-      map[r.day_index] = total > 0 && done === total;
-    });
-    setDayDoneMap(map);
-  }, [userId, phase]);
+  useEffect(() => { loadRow(); loadPhotos(); }, [loadRow, loadPhotos]);
 
-  useEffect(() => { loadRow(); loadPhotos(); loadDoneMap(); }, [loadRow, loadPhotos, loadDoneMap]);
-
-  async function saveRow(newItems) {
-    const total = day.items.length;
-    const done = newItems.filter((it) => it.checked).length;
-    const complete = total > 0 && done === total;
-    const calories = complete ? Math.round(day.metaMET * 90 * (day.duration / 60)) : null; // fallback weight 90 if profile missing
-
-    const { data: profile } = await supabase.from('profiles').select('weight').eq('id', userId).maybeSingle();
-    const bodyWeight = profile?.weight || 90;
-    const realCalories = complete ? Math.round(day.metaMET * bodyWeight * (day.duration / 60)) : null;
-
-    const payload = {
-      user_id: userId, date: todayStr(), phase, day_index: dayIndex,
-      title: day.title, items: newItems, calories: realCalories,
-    };
-    const { data, error } = await supabase.from('workout_logs')
-      .upsert(payload, { onConflict: 'user_id,date,phase,day_index' })
-      .select().single();
-    if (!error) { setRow(data); flash('Gespeichert'); loadDoneMap(); }
-    else flash('Fehler beim Speichern');
+  async function persistItems(newItems) {
+    setRow((r) => ({ ...r, items: newItems }));
+    const payload = { user_id: userId, date: todayStr(), phase, day_index: dayIndex, title: day.title, items: newItems };
+    const { error } = await supabase.from('workout_logs')
+      .upsert(payload, { onConflict: 'user_id,date,phase,day_index' });
+    if (!error) flash('Gespeichert'); else flash('Fehler beim Speichern');
   }
 
   function toggleItem(i) {
     const newItems = row.items.map((it, idx) => idx === i ? { ...it, checked: !it.checked } : it);
-    setRow({ ...row, items: newItems });
-    saveRow(newItems);
+    persistItems(newItems);
   }
-
   function changeWeight(i, val) {
     const newItems = row.items.map((it, idx) => idx === i ? { ...it, weight: val, checked: val.trim() !== '' } : it);
-    setRow({ ...row, items: newItems });
-    saveRow(newItems);
+    persistItems(newItems);
   }
 
   async function resetDay() {
     await supabase.from('workout_logs').delete()
       .eq('user_id', userId).eq('date', todayStr()).eq('phase', phase).eq('day_index', dayIndex);
     setTrainingStart(null); setElapsedSec(0);
-    loadRow(); loadDoneMap();
+    loadRow();
   }
 
-  async function finishTraining() {
+  function startTraining() { setTrainingStart(Date.now()); setElapsedSec(0); }
+
+  async function endTraining() {
+    const minutesUsed = Math.max(1, Math.round(elapsedSec / 60));
     const total = day.items.length;
     const done = row.items.filter((it) => it.checked).length;
-    const completionRatio = total > 0 ? done / total : 0;
+    const scaleFactor = done === 0 ? 0.3 : Math.max(done / total, 0.6); // still credited even if 1-2 exercises missing
 
-    // Use real elapsed time if the timer was running, otherwise fall back to the plan's default duration.
-    const minutesUsed = trainingStart ? Math.max(1, Math.round(elapsedSec / 60)) : day.duration;
-
-    const { data: profile } = await supabase.from('profiles').select('weight').eq('id', userId).maybeSingle();
-    const bodyWeight = profile?.weight || 90;
-
-    // Full-session calories for the time spent, scaled down a bit if a lot of exercises were skipped.
-    const scaleFactor = done === 0 ? 0 : Math.max(completionRatio, 0.6); // still count it even if 1-2 exercises missing
+    const { data: prof } = await supabase.from('profiles').select('weight').eq('id', userId).maybeSingle();
+    const bodyWeight = prof?.weight || 90;
     const calories = Math.round(day.metaMET * bodyWeight * (minutesUsed / 60) * scaleFactor);
 
     const payload = {
       user_id: userId, date: todayStr(), phase, day_index: dayIndex,
-      title: day.title, items: row.items, calories,
+      title: day.title, items: row.items, calories, duration_minutes: minutesUsed,
     };
-    const { data, error } = await supabase.from('workout_logs')
+    const { data: savedRow, error } = await supabase.from('workout_logs')
       .upsert(payload, { onConflict: 'user_id,date,phase,day_index' })
       .select().single();
 
-    if (!error) {
-      setRow(data);
-      flash(`Training gespeichert · ${calories} kcal · ${minutesUsed} Min.`);
-      setTrainingStart(null); setElapsedSec(0);
-      loadDoneMap();
-    } else {
-      flash('Fehler beim Speichern');
-    }
+    if (error) { flash('Fehler beim Speichern'); return; }
+
+    const nextDayIndex = (dayIndex + 1) % 7;
+    const { data: updatedProfile } = await supabase.from('profiles')
+      .upsert({ id: userId, current_phase: phase, current_day_index: nextDayIndex, last_training_date: todayStr() })
+      .select().single();
+
+    setTrainingStart(null); setElapsedSec(0);
+    flash(`Gespeichert · ${calories} kcal · ${minutesUsed} Min.`);
+    onFinished(updatedProfile, savedRow);
   }
 
   async function uploadPhoto(i, file) {
@@ -204,6 +263,13 @@ function TrainingTab({ userId, phase, setPhase, dayIndex, setDayIndex, flash }) 
     flash('Foto gespeichert');
   }
 
+  function changeDay(delta) {
+    let idx = dayIndex + delta;
+    if (idx < 0) idx = 6;
+    if (idx > 6) idx = 0;
+    setDayIndex(idx);
+  }
+
   if (!row) return null;
   const total = day.items.length;
   const done = row.items.filter((it) => it.checked).length;
@@ -216,12 +282,13 @@ function TrainingTab({ userId, phase, setPhase, dayIndex, setDayIndex, flash }) 
         <button className={`phase-btn ${phase === 2 ? 'active-p2' : ''}`} onClick={() => { setPhase(2); setDayIndex(0); }}>Phase 2 · Hanteln</button>
       </div>
 
-      <div className="day-tabs">
-        {PLAN[phase].map((d, idx) => (
-          <button key={idx} className={`day-tab ${idx === dayIndex ? 'active' : ''} ${dayDoneMap[idx] ? 'done' : ''}`} onClick={() => setDayIndex(idx)}>
-            Tag {idx + 1}<span className="dot" />
-          </button>
-        ))}
+      <div className="day-nav">
+        <button className="nav-arrow" onClick={() => changeDay(-1)} aria-label="Vorheriger Tag">‹</button>
+        <div className="day-nav-label">
+          <span>Tag {dayIndex + 1}</span>
+          <span className="day-nav-sub">von 7</span>
+        </div>
+        <button className="nav-arrow" onClick={() => changeDay(1)} aria-label="Nächster Tag">›</button>
       </div>
 
       <div className="card">
@@ -255,7 +322,7 @@ function TrainingTab({ userId, phase, setPhase, dayIndex, setDayIndex, flash }) 
                       <span>diese Woche</span>
                     </div>
                     <label className="camera-btn">
-                      📷 Foto
+                      📷
                       <input type="file" accept="image/*" capture="environment" style={{ display: 'none' }}
                         onChange={(e) => { const f = e.target.files[0]; if (f) uploadPhoto(i, f); }} />
                     </label>
@@ -269,20 +336,15 @@ function TrainingTab({ userId, phase, setPhase, dayIndex, setDayIndex, flash }) 
         <div className="cardio-line">{day.cardio}</div>
 
         <div className="timer-box">
+          <div className="timer-date">{formatDateTime(now)}</div>
           {trainingStart ? (
             <>
               <div className="timer-display">{String(Math.floor(elapsedSec / 60)).padStart(2, '0')}:{String(elapsedSec % 60).padStart(2, '0')}</div>
-              <button className="finish-btn" onClick={finishTraining}>✅ Training beenden &amp; speichern</button>
+              <button className="timer-btn" onClick={endTraining}>Training beenden</button>
             </>
           ) : (
-            <>
-              <button className="start-btn" onClick={startTraining}>▶️ Training starten</button>
-              <button className="finish-btn-outline" onClick={finishTraining}>✅ Training für heute abschließen</button>
-            </>
+            <button className="timer-btn" onClick={startTraining}>Training starten</button>
           )}
-          <p className="field-note" style={{ marginTop: 8 }}>
-            &quot;Training beenden&quot; speichert auch, wenn ein paar Übungen fehlen — die Kalorien werden trotzdem berechnet.
-          </p>
         </div>
 
         <div className="footer-row">
@@ -299,10 +361,15 @@ function VerlaufTab({ userId }) {
   const [weekDays, setWeekDays] = useState(0);
   const [calYear, setCalYear] = useState(new Date().getFullYear());
   const [calMonth, setCalMonth] = useState(new Date().getMonth());
-  const [historyDates, setHistoryDates] = useState({}); // date -> array of rows
+  const [historyDates, setHistoryDates] = useState({});
   const [selectedDate, setSelectedDate] = useState(null);
   const [weightByDate, setWeightByDate] = useState({});
   const [weightLog, setWeightLog] = useState([]);
+  const [durationPoints, setDurationPoints] = useState([]);
+
+  const [exPhase, setExPhase] = useState(1);
+  const [exSelection, setExSelection] = useState('0-0'); // "dayIndex-itemIndex"
+  const [exPoints, setExPoints] = useState([]);
 
   useEffect(() => {
     (async () => {
@@ -325,8 +392,26 @@ function VerlaufTab({ userId }) {
       setWeightLog(wlog || []);
       const wmap = {}; (wlog || []).forEach((w) => { wmap[w.date] = w; });
       setWeightByDate(wmap);
+
+      const { data: durRows } = await supabase.from('workout_logs').select('date, duration_minutes')
+        .eq('user_id', userId).not('duration_minutes', 'is', null).order('date');
+      const seen = {};
+      (durRows || []).forEach((r) => { seen[r.date] = r.duration_minutes; }); // one point per date
+      setDurationPoints(Object.entries(seen).map(([date, value]) => ({ date, value })));
     })();
   }, [userId, calYear, calMonth]);
+
+  useEffect(() => {
+    (async () => {
+      const [dIdx, iIdx] = exSelection.split('-').map(Number);
+      const { data } = await supabase.from('workout_logs').select('date, items')
+        .eq('user_id', userId).eq('phase', exPhase).eq('day_index', dIdx).order('date');
+      const pts = (data || [])
+        .map((r) => ({ date: r.date, value: parseFloat(r.items?.[iIdx]?.weight) }))
+        .filter((p) => !isNaN(p.value));
+      setExPoints(pts);
+    })();
+  }, [userId, exPhase, exSelection]);
 
   const monthNames = ['Januar','Februar','März','April','Mai','Juni','Juli','August','September','Oktober','November','Dezember'];
   const firstDay = new Date(calYear, calMonth, 1);
@@ -341,26 +426,7 @@ function VerlaufTab({ userId }) {
   }
 
   const sortedWeights = [...weightLog].sort((a, b) => a.date.localeCompare(b.date));
-  let chartSvg = null;
-  if (sortedWeights.length >= 2) {
-    const values = sortedWeights.map((w) => parseFloat(w.weight)).filter((v) => !isNaN(v));
-    const min = Math.min(...values) - 1, max = Math.max(...values) + 1;
-    const W = 320, H = 120, padL = 8, padR = 8, padT = 10, padB = 10;
-    const innerW = W - padL - padR, innerH = H - padT - padB;
-    const pts = sortedWeights.map((w, i) => {
-      const x = padL + (innerW * i) / (sortedWeights.length - 1);
-      const v = parseFloat(w.weight);
-      const y = padT + innerH - ((v - min) / (max - min)) * innerH;
-      return { x, y };
-    });
-    const linePath = pts.map((p, i) => (i === 0 ? 'M' : 'L') + p.x.toFixed(1) + ',' + p.y.toFixed(1)).join(' ');
-    chartSvg = (
-      <svg viewBox={`0 0 ${W} ${H}`} style={{ width: '100%', height: 120 }}>
-        <path d={linePath} fill="none" stroke="#c1622d" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
-        {pts.map((p, i) => <circle key={i} cx={p.x} cy={p.y} r="3" fill="#c1622d" />)}
-      </svg>
-    );
-  }
+  const weightPoints = sortedWeights.map((w) => ({ date: w.date, value: parseFloat(w.weight) })).filter((p) => !isNaN(p.value));
 
   return (
     <>
@@ -370,9 +436,9 @@ function VerlaufTab({ userId }) {
       </div>
 
       <div className="cal-nav">
-        <button onClick={() => shiftMonth(-1)}>←</button>
+        <button onClick={() => shiftMonth(-1)}>‹</button>
         <span className="cal-title">{monthNames[calMonth]} {calYear}</span>
-        <button onClick={() => shiftMonth(1)}>→</button>
+        <button onClick={() => shiftMonth(1)}>›</button>
       </div>
       <div className="cal-grid">
         {['Mo','Di','Mi','Do','Fr','Sa','So'].map((d) => <div key={d} className="cal-dow">{d}</div>)}
@@ -414,7 +480,10 @@ function VerlaufTab({ userId }) {
                       </li>
                     ))}
                   </ul>
-                  {entry.calories && <div className="kcal-line">{entry.calories} kcal geschätzt</div>}
+                  <div className="kcal-line">
+                    {entry.calories ? `${entry.calories} kcal` : ''}
+                    {entry.duration_minutes ? ` · ${entry.duration_minutes} Min.` : ''}
+                  </div>
                 </div>
               ))
             )}
@@ -429,12 +498,35 @@ function VerlaufTab({ userId }) {
 
       <div className="chart-card">
         <h3>Gewichtsverlauf</h3>
-        {chartSvg || <p className="weight-empty-note">Noch nicht genug Einträge für ein Diagramm. Trage dein Gewicht ein paarmal unter &quot;Einstellungen&quot; ein.</p>}
+        <LineChart points={weightPoints} color="#c1622d" />
         <ul className="weight-log-list">
           {[...sortedWeights].reverse().map((w) => (
             <li key={w.date}><span>{w.date}</span><span>{w.weight} kg{w.height ? ` · ${w.height} cm` : ''}</span></li>
           ))}
         </ul>
+      </div>
+
+      <div className="chart-card">
+        <h3>Trainingsdauer</h3>
+        <LineChart points={durationPoints} color="#2d4a3a" />
+      </div>
+
+      <div className="chart-card">
+        <h3>Kraftverlauf pro Übung</h3>
+        <div className="phase-toggle" style={{ marginBottom: 10 }}>
+          <button className={`phase-btn ${exPhase === 1 ? 'active-p1' : ''}`} onClick={() => { setExPhase(1); setExSelection('0-0'); }}>Phase 1</button>
+          <button className={`phase-btn ${exPhase === 2 ? 'active-p2' : ''}`} onClick={() => { setExPhase(2); setExSelection('0-0'); }}>Phase 2</button>
+        </div>
+        <select className="exercise-select" value={exSelection} onChange={(e) => setExSelection(e.target.value)}>
+          {PLAN[exPhase].map((d, dIdx) => (
+            <optgroup key={dIdx} label={d.title}>
+              {d.items.map((text, iIdx) => (
+                <option key={iIdx} value={`${dIdx}-${iIdx}`}>{text.split(' – ')[0]}</option>
+              ))}
+            </optgroup>
+          ))}
+        </select>
+        <LineChart points={exPoints} color="#4b6ea9" />
       </div>
     </>
   );
