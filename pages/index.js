@@ -1,7 +1,7 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { useRouter } from 'next/router';
 import { supabase } from '../lib/supabaseClient';
-import { PLAN, pickIcon, ICONS } from '../lib/plan';
+import { PLAN, pickIcon, ICONS, ALTERNATIVES } from '../lib/plan';
 
 function iconSvg(key) {
   return (
@@ -16,28 +16,33 @@ function formatDateTime(d) {
 }
 
 /* Reusable minimal line chart (weight, duration, per-exercise weight all use this) */
-function LineChart({ points, color = '#c1622d' }) {
+function LineChart({ points, color = '#c1622d', unit = '' }) {
   if (!points || points.length < 2) {
     return <p className="weight-empty-note">Noch nicht genug Einträge für ein Diagramm.</p>;
   }
   const values = points.map((p) => p.value);
-  const min = Math.min(...values) - 1, max = Math.max(...values) + 1;
-  const W = 320, H = 110, pad = 10;
-  const innerW = W - pad * 2, innerH = H - pad * 2;
+  const dataMin = Math.min(...values), dataMax = Math.max(...values);
+  const min = dataMin - 1, max = dataMax + 1;
+  const W = 320, H = 110, padTop = 10, padBottom = 10, padLeft = 34, padRight = 8;
+  const innerW = W - padLeft - padRight, innerH = H - padTop - padBottom;
   const pts = points.map((p, i) => ({
-    x: pad + (innerW * i) / (points.length - 1),
-    y: pad + innerH - ((p.value - min) / (max - min || 1)) * innerH,
+    x: padLeft + (innerW * i) / (points.length - 1),
+    y: padTop + innerH - ((p.value - min) / (max - min || 1)) * innerH,
   }));
   const linePath = pts.map((p, i) => (i === 0 ? 'M' : 'L') + p.x.toFixed(1) + ',' + p.y.toFixed(1)).join(' ');
+  const fmt = (v) => (Number.isInteger(v) ? v : v.toFixed(1));
   return (
     <>
       <svg viewBox={`0 0 ${W} ${H}`} style={{ width: '100%', height: 110 }}>
+        <text x="2" y={padTop + 4} fontSize="9" fill="#75674f">{fmt(dataMax)}{unit}</text>
+        <text x="2" y={padTop + innerH + 3} fontSize="9" fill="#75674f">{fmt(dataMin)}{unit}</text>
+        <line x1={padLeft} y1={padTop} x2={padLeft} y2={padTop + innerH} stroke="#ddccac" strokeWidth="1" />
         <path d={linePath} fill="none" stroke={color} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
         {pts.map((p, i) => <circle key={i} cx={p.x} cy={p.y} r="3" fill={color} />)}
       </svg>
       <div className="chart-meta">
-        <span>{points[0].date}: {points[0].value}</span>
-        <span>{points[points.length - 1].date}: {points[points.length - 1].value}</span>
+        <span>{points[0].date}: {points[0].value}{unit}</span>
+        <span>{points[points.length - 1].date}: {points[points.length - 1].value}{unit}</span>
       </div>
     </>
   );
@@ -160,39 +165,83 @@ function TrainingTab({ userId, profile, flash, onFinished }) {
   const [dayIndex, setDayIndex] = useState(profile.current_day_index || 0);
   const [row, setRow] = useState(null);
   const [photos, setPhotos] = useState({});
-  const [trainingStart, setTrainingStart] = useState(null);
+  const [overrides, setOverrides] = useState({});
+  const [lastWeights, setLastWeights] = useState({});
+  const [expandedAlt, setExpandedAlt] = useState(null);
+  const [activeSession, setActiveSession] = useState(undefined); // undefined=loading, null=none running
   const [elapsedSec, setElapsedSec] = useState(0);
   const [now, setNow] = useState(new Date());
+  const appliedInitialSession = useRef(false);
   const day = PLAN[phase][dayIndex];
 
+  // clock, purely cosmetic
   useEffect(() => {
     const id = setInterval(() => setNow(new Date()), 1000 * 30);
     return () => clearInterval(id);
   }, []);
 
-  useEffect(() => {
-    if (!trainingStart) return;
-    const id = setInterval(() => setElapsedSec(Math.floor((Date.now() - trainingStart) / 1000)), 1000);
-    return () => clearInterval(id);
-  }, [trainingStart]);
+  // Load whether a session is already running (e.g. app was closed and reopened)
+  const loadActiveSession = useCallback(async () => {
+    const { data } = await supabase.from('active_sessions').select('*').eq('user_id', userId).maybeSingle();
+    setActiveSession(data || null);
+  }, [userId]);
+  useEffect(() => { loadActiveSession(); }, [loadActiveSession]);
 
-  const loadRow = useCallback(async () => {
-    const { data } = await supabase.from('workout_logs').select('*')
-      .eq('user_id', userId).eq('date', todayStr()).eq('phase', phase).eq('day_index', dayIndex)
-      .maybeSingle();
-    if (data) setRow(data);
-    else setRow({ items: day.items.map((text) => ({ text, checked: false, weight: '' })), calories: null, duration_minutes: null });
+  // If a session is already running when the app loads, jump straight to that day
+  useEffect(() => {
+    if (activeSession && !appliedInitialSession.current) {
+      setPhase(activeSession.phase);
+      setDayIndex(activeSession.day_index);
+      appliedInitialSession.current = true;
+    }
+  }, [activeSession]);
+
+  // Timer display: always recomputed from the DB timestamp, so backgrounding
+  // or reloading the page never loses time — it just recalculates on resume.
+  useEffect(() => {
+    if (!activeSession) { setElapsedSec(0); return; }
+    const startMs = new Date(activeSession.started_at).getTime();
+    const tick = () => setElapsedSec(Math.floor((Date.now() - startMs) / 1000));
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [activeSession]);
+
+  const loadAll = useCallback(async () => {
+    const [ovRes, rowRes, photoRes, lastRes] = await Promise.all([
+      supabase.from('exercise_overrides').select('item_index, exercise_name')
+        .eq('user_id', userId).eq('phase', phase).eq('day_index', dayIndex),
+      supabase.from('workout_logs').select('*')
+        .eq('user_id', userId).eq('date', todayStr()).eq('phase', phase).eq('day_index', dayIndex).maybeSingle(),
+      supabase.from('exercise_photos').select('item_index, photo_url')
+        .eq('user_id', userId).eq('phase', phase).eq('day_index', dayIndex),
+      supabase.from('workout_logs').select('date, items')
+        .eq('user_id', userId).eq('phase', phase).eq('day_index', dayIndex)
+        .lt('date', todayStr()).order('date', { ascending: false }).limit(1),
+    ]);
+
+    const ovMap = {};
+    (ovRes.data || []).forEach((o) => { ovMap[o.item_index] = o.exercise_name; });
+    setOverrides(ovMap);
+
+    const photoMap = {};
+    (photoRes.data || []).forEach((p) => { photoMap[p.item_index] = p.photo_url; });
+    setPhotos(photoMap);
+
+    const lwMap = {};
+    const lastRow = (lastRes.data || [])[0];
+    if (lastRow) (lastRow.items || []).forEach((it, idx) => { if (it.weight) lwMap[idx] = it.weight; });
+    setLastWeights(lwMap);
+
+    if (rowRes.data) {
+      setRow(rowRes.data);
+    } else {
+      const items = day.items.map((text, idx) => ({ text: ovMap[idx] || text, checked: false, weight: '' }));
+      setRow({ items, calories: null, duration_minutes: null });
+    }
   }, [userId, phase, dayIndex, day.items]);
 
-  const loadPhotos = useCallback(async () => {
-    const { data } = await supabase.from('exercise_photos').select('item_index, photo_url')
-      .eq('user_id', userId).eq('phase', phase).eq('day_index', dayIndex);
-    const map = {};
-    (data || []).forEach((p) => { map[p.item_index] = p.photo_url; });
-    setPhotos(map);
-  }, [userId, phase, dayIndex]);
-
-  useEffect(() => { loadRow(); loadPhotos(); }, [loadRow, loadPhotos]);
+  useEffect(() => { loadAll(); }, [loadAll]);
 
   async function persistItems(newItems) {
     setRow((r) => ({ ...r, items: newItems }));
@@ -211,20 +260,41 @@ function TrainingTab({ userId, profile, flash, onFinished }) {
     persistItems(newItems);
   }
 
+  async function chooseAlternative(i, name) {
+    await supabase.from('exercise_overrides').upsert(
+      { user_id: userId, phase, day_index: dayIndex, item_index: i, exercise_name: name },
+      { onConflict: 'user_id,phase,day_index,item_index' }
+    );
+    setOverrides((o) => ({ ...o, [i]: name }));
+    const newItems = row.items.map((it, idx) => idx === i ? { ...it, text: name } : it);
+    persistItems(newItems);
+    setExpandedAlt(null);
+  }
+
   async function resetDay() {
     await supabase.from('workout_logs').delete()
       .eq('user_id', userId).eq('date', todayStr()).eq('phase', phase).eq('day_index', dayIndex);
-    setTrainingStart(null); setElapsedSec(0);
-    loadRow();
+    if (activeSession) {
+      await supabase.from('active_sessions').delete().eq('user_id', userId);
+      setActiveSession(null);
+    }
+    loadAll();
   }
 
-  function startTraining() { setTrainingStart(Date.now()); setElapsedSec(0); }
+  async function startTraining() {
+    const startedAt = new Date().toISOString();
+    const { data, error } = await supabase.from('active_sessions')
+      .upsert({ user_id: userId, phase, day_index: dayIndex, started_at: startedAt }, { onConflict: 'user_id' })
+      .select().single();
+    if (!error) setActiveSession(data);
+  }
 
   async function endTraining() {
-    const minutesUsed = Math.max(1, Math.round(elapsedSec / 60));
+    const startMs = new Date(activeSession.started_at).getTime();
+    const minutesUsed = Math.max(1, Math.round((Date.now() - startMs) / 60000));
     const total = day.items.length;
     const done = row.items.filter((it) => it.checked).length;
-    const scaleFactor = done === 0 ? 0.3 : Math.max(done / total, 0.6); // still credited even if 1-2 exercises missing
+    const scaleFactor = done === 0 ? 0.3 : Math.max(done / total, 0.6);
 
     const { data: prof } = await supabase.from('profiles').select('weight').eq('id', userId).maybeSingle();
     const bodyWeight = prof?.weight || 90;
@@ -240,12 +310,14 @@ function TrainingTab({ userId, profile, flash, onFinished }) {
 
     if (error) { flash('Fehler beim Speichern'); return; }
 
+    await supabase.from('active_sessions').delete().eq('user_id', userId);
+    setActiveSession(null);
+
     const nextDayIndex = (dayIndex + 1) % 7;
     const { data: updatedProfile } = await supabase.from('profiles')
       .upsert({ id: userId, current_phase: phase, current_day_index: nextDayIndex, last_training_date: todayStr() })
       .select().single();
 
-    setTrainingStart(null); setElapsedSec(0);
     flash(`Gespeichert · ${calories} kcal · ${minutesUsed} Min.`);
     onFinished(updatedProfile, savedRow);
   }
@@ -259,11 +331,12 @@ function TrainingTab({ userId, profile, flash, onFinished }) {
       { user_id: userId, phase, day_index: dayIndex, item_index: i, photo_url: pub.publicUrl },
       { onConflict: 'user_id,phase,day_index,item_index' }
     );
-    loadPhotos();
+    loadAll();
     flash('Foto gespeichert');
   }
 
   function changeDay(delta) {
+    if (activeSession) return; // locked while a training is running
     let idx = dayIndex + delta;
     if (idx < 0) idx = 6;
     if (idx > 6) idx = 0;
@@ -274,21 +347,22 @@ function TrainingTab({ userId, profile, flash, onFinished }) {
   const total = day.items.length;
   const done = row.items.filter((it) => it.checked).length;
   const showWeightUI = dayIndex !== 6;
+  const locked = !!activeSession;
 
   return (
     <>
       <div className="phase-toggle">
-        <button className={`phase-btn ${phase === 1 ? 'active-p1' : ''}`} onClick={() => { setPhase(1); setDayIndex(0); }}>Phase 1 · Maschinen</button>
-        <button className={`phase-btn ${phase === 2 ? 'active-p2' : ''}`} onClick={() => { setPhase(2); setDayIndex(0); }}>Phase 2 · Hanteln</button>
+        <button disabled={locked} className={`phase-btn ${phase === 1 ? 'active-p1' : ''}`} onClick={() => { if (!locked) { setPhase(1); setDayIndex(0); } }}>Phase 1 · Maschinen</button>
+        <button disabled={locked} className={`phase-btn ${phase === 2 ? 'active-p2' : ''}`} onClick={() => { if (!locked) { setPhase(2); setDayIndex(0); } }}>Phase 2 · Hanteln</button>
       </div>
 
       <div className="day-nav">
-        <button className="nav-arrow" onClick={() => changeDay(-1)} aria-label="Vorheriger Tag">‹</button>
+        <button className="nav-arrow" onClick={() => changeDay(-1)} disabled={locked} aria-label="Vorheriger Tag">‹</button>
         <div className="day-nav-label">
           <span>Tag {dayIndex + 1}</span>
-          <span className="day-nav-sub">von 7</span>
+          <span className="day-nav-sub">{locked ? '🔒 Training läuft' : 'von 7'}</span>
         </div>
-        <button className="nav-arrow" onClick={() => changeDay(1)} aria-label="Nächster Tag">›</button>
+        <button className="nav-arrow" onClick={() => changeDay(1)} disabled={locked} aria-label="Nächster Tag">›</button>
       </div>
 
       <div className="card">
@@ -299,33 +373,50 @@ function TrainingTab({ userId, profile, flash, onFinished }) {
         <div className="progress-track"><div className="progress-fill" style={{ width: total ? `${(done / total) * 100}%` : '0%' }} /></div>
 
         <ul className="items">
-          {day.items.map((text, i) => {
-            const it = row.items[i] || { checked: false, weight: '' };
-            const iconKey = pickIcon(text);
+          {day.items.map((defaultText, i) => {
+            const it = row.items[i] || { text: defaultText, checked: false, weight: '' };
+            const displayText = it.text || defaultText;
+            const iconKey = pickIcon(displayText);
             const photoUrl = photos[i];
+            const altOptions = Array.from(new Set([defaultText, ...(ALTERNATIVES[iconKey] || [])]))
+              .filter((opt) => opt !== displayText);
             return (
               <li key={i} className={`item ${it.checked ? 'checked' : ''}`}>
-                <div className="item-top" onClick={() => toggleItem(i)}>
-                  <span className="checkbox">
+                <div className="item-top">
+                  <span className="checkbox" onClick={() => toggleItem(i)}>
                     <svg viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
                       <polyline points="20 6 9 17 4 12"></polyline>
                     </svg>
                   </span>
-                  <span className="icon-box">{photoUrl ? <img src={photoUrl} alt="Foto" /> : iconSvg(iconKey)}</span>
-                  <span className="item-text">{text}</span>
+                  <span className="icon-box" onClick={() => toggleItem(i)}>{photoUrl ? <img src={photoUrl} alt="Foto" /> : iconSvg(iconKey)}</span>
+                  <span className="item-text" onClick={() => toggleItem(i)}>{displayText}</span>
+                  <button type="button" className="alt-toggle-btn" onClick={() => setExpandedAlt(expandedAlt === i ? null : i)}>
+                    {expandedAlt === i ? '−' : '+'}
+                  </button>
                 </div>
                 {showWeightUI && (
                   <div className="item-bottom">
                     <div className="weight-field">
                       <input type="number" step="0.5" placeholder="kg" value={it.weight || ''}
-                        onChange={(e) => changeWeight(i, e.target.value)} onClick={(e) => e.stopPropagation()} />
-                      <span>diese Woche</span>
+                        onChange={(e) => changeWeight(i, e.target.value)} />
+                      <span>kg</span>
                     </div>
+                    {lastWeights[i] && !it.weight && (
+                      <span className="last-weight-hint">zuletzt {lastWeights[i]} kg</span>
+                    )}
                     <label className="camera-btn">
                       📷
                       <input type="file" accept="image/*" capture="environment" style={{ display: 'none' }}
                         onChange={(e) => { const f = e.target.files[0]; if (f) uploadPhoto(i, f); }} />
                     </label>
+                  </div>
+                )}
+                {expandedAlt === i && (
+                  <div className="alt-list">
+                    <p className="alt-list-label">Alternative wählen:</p>
+                    {altOptions.map((opt) => (
+                      <button type="button" key={opt} className="alt-option" onClick={() => chooseAlternative(i, opt)}>{opt}</button>
+                    ))}
                   </div>
                 )}
               </li>
@@ -337,7 +428,7 @@ function TrainingTab({ userId, profile, flash, onFinished }) {
 
         <div className="timer-box">
           <div className="timer-date">{formatDateTime(now)}</div>
-          {trainingStart ? (
+          {activeSession ? (
             <>
               <div className="timer-display">{String(Math.floor(elapsedSec / 60)).padStart(2, '0')}:{String(elapsedSec % 60).padStart(2, '0')}</div>
               <button className="timer-btn" onClick={endTraining}>Training beenden</button>
@@ -348,7 +439,7 @@ function TrainingTab({ userId, profile, flash, onFinished }) {
         </div>
 
         <div className="footer-row">
-          <button className="reset-btn" onClick={resetDay}>Diesen Tag zurücksetzen</button>
+          <button className="reset-btn" onClick={resetDay} disabled={locked}>Diesen Tag zurücksetzen</button>
         </div>
       </div>
     </>
@@ -498,7 +589,7 @@ function VerlaufTab({ userId }) {
 
       <div className="chart-card">
         <h3>Gewichtsverlauf</h3>
-        <LineChart points={weightPoints} color="#c1622d" />
+        <LineChart points={weightPoints} color="#c1622d" unit=" kg" />
         <ul className="weight-log-list">
           {[...sortedWeights].reverse().map((w) => (
             <li key={w.date}><span>{w.date}</span><span>{w.weight} kg{w.height ? ` · ${w.height} cm` : ''}</span></li>
@@ -508,7 +599,7 @@ function VerlaufTab({ userId }) {
 
       <div className="chart-card">
         <h3>Trainingsdauer</h3>
-        <LineChart points={durationPoints} color="#2d4a3a" />
+        <LineChart points={durationPoints} color="#2d4a3a" unit=" min" />
       </div>
 
       <div className="chart-card">
@@ -526,7 +617,7 @@ function VerlaufTab({ userId }) {
             </optgroup>
           ))}
         </select>
-        <LineChart points={exPoints} color="#4b6ea9" />
+        <LineChart points={exPoints} color="#4b6ea9" unit=" kg" />
       </div>
     </>
   );
