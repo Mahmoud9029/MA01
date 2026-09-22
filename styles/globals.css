@@ -53,6 +53,11 @@ ul.items { list-style: none; margin: 0; padding: 0; }
 .weight-field input { width: 58px; padding: 6px 7px; border-radius: 6px; border: 1.5px solid var(--paper-line); font-size: 13px; }
 .weight-field span { font-size: 11.5px; color: var(--ink-soft); }
 .camera-btn { background: #fff; border: 1.5px solid var(--paper-line); border-radius: 6px; padding: 6px 10px; font-size: 15px; cursor: pointer; }
+.alt-toggle-btn { flex: 0 0 auto; width: 26px; height: 26px; border-radius: 50%; border: 1.5px solid var(--paper-line); background: #fff; color: var(--ink-soft); font-size: 16px; line-height: 1; cursor: pointer; margin-top: 4px; }
+.last-weight-hint { font-size: 11px; color: var(--ink-soft); font-style: italic; }
+.alt-list { margin: 8px 0 4px 48px; padding: 10px; background: var(--accent-soft); border-radius: 8px; display: flex; flex-wrap: wrap; gap: 6px; }
+.alt-list-label { width: 100%; font-size: 11.5px; color: var(--ink-soft); margin: 0 0 4px; }
+.alt-option { background: #fff; border: 1.5px solid var(--accent); color: var(--accent); border-radius: 6px; padding: 6px 10px; font-size: 12.5px; cursor: pointer; }
 .cardio-line { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--paper-line); font-size: 13.5px; color: var(--ink-soft); font-style: italic; }
 
 .timer-box { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--paper-line); text-align: center; }
